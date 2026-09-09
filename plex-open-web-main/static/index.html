@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Plex Open Web</title>
+    <script>
+      (() => {
+        const key = "plex-open-web-theme-v1";
+        let theme = "system";
+        try {
+          const stored = localStorage.getItem(key);
+          theme = ["system", "light", "dark"].includes(stored) ? stored : "system";
+        } catch {}
+        const systemDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.dataset.resolvedTheme = theme === "system" ? (systemDark ? "dark" : "light") : theme;
+      })();
+    </script>
+    <link rel="stylesheet" href="/styles.css?v=__APP_VERSION__" />
+  </head>
+  <body>
+    <main id="login" class="login-shell" hidden>
+      <form id="login-form" class="login-panel">
+        <div class="brand-mark">POW</div>
+        <h1>Plex Open Web</h1>
+        <p id="login-version" class="app-version">Version __APP_VERSION__</p>
+        <div class="theme-field">
+          <label for="login-theme">Color theme</label>
+          <select id="login-theme">
+            <option value="system">System</option>
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+          </select>
+        </div>
+        <label for="password">Password</label>
+        <div class="login-row">
+          <input id="password" name="password" type="password" autocomplete="current-password" autofocus />
+          <button type="submit">Sign in</button>
+        </div>
+        <p id="login-error" class="error-text" aria-live="polite"></p>
+      </form>
+    </main>
+
+    <main id="app" class="app-shell" hidden>
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">POW</div>
+          <div>
+            <strong>Plex Open Web</strong>
+            <span id="server-name">Media server</span>
+            <span id="app-version" class="app-version">Version __APP_VERSION__</span>
+          </div>
+        </div>
+        <nav id="libraries" class="library-list" aria-label="Libraries"></nav>
+        <button id="device-downloads" class="library-button device-downloads-button" type="button" hidden>
+          <span>Downloads</span>
+          <small id="device-downloads-summary">This browser</small>
+        </button>
+        <div class="sidebar-footer">
+          <label class="theme-field" for="app-theme">
+            <span>Color theme</span>
+            <select id="app-theme">
+              <option value="system">System</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </label>
+          <button id="logout" class="ghost-button">Sign out</button>
+        </div>
+      </aside>
+
+      <section class="content">
+        <header class="topbar">
+          <div>
+            <div id="breadcrumbs" class="breadcrumbs"></div>
+            <h1 id="view-title">Library</h1>
+          </div>
+          <form id="search-form" class="search">
+            <input id="search-input" type="search" placeholder="Search" autocomplete="off" />
+            <button type="submit">Search</button>
+          </form>
+        </header>
+
+        <div class="toolbar">
+          <div class="segmented" role="tablist" aria-label="View">
+            <button class="view-button" data-view="continue">Continue</button>
+            <button class="view-button" data-view="recent">Recent</button>
+            <button class="view-button active" data-view="all">All</button>
+            <button class="view-button" data-view="unwatched">Unwatched</button>
+            <button class="view-button" data-view="collections">Collections</button>
+            <button class="view-button" data-view="mylist">My List</button>
+            <button class="view-button" data-view="queue">Queue</button>
+          </div>
+          <div class="toolbar-actions">
+            <select id="genre-filter" aria-label="Genre">
+              <option value="">All genres</option>
+            </select>
+            <select id="sort" aria-label="Sort">
+              <option value="addedAt:desc">Recently added</option>
+              <option value="titleSort">Title</option>
+              <option value="year:desc">Year</option>
+              <option value="lastViewedAt:desc">Recently watched</option>
+            </select>
+            <button id="surprise-me" class="secondary-button" type="button">Surprise me</button>
+            <button id="scan-library" class="scan-button" type="button" title="Ask Plex to scan this library">Scan library</button>
+          </div>
+        </div>
+
+        <div id="status" class="status" aria-live="polite"></div>
+        <section id="grid" class="media-grid" aria-live="polite"></section>
+        <button id="load-more" class="load-more-button" type="button" hidden>Load more</button>
+      </section>
+    </main>
+
+    <dialog id="details-dialog" class="details-dialog">
+      <div class="details-layout">
+        <img id="details-poster" alt="" />
+        <section>
+          <div class="details-head">
+            <div>
+              <p id="details-kicker"></p>
+              <h2 id="details-title"></h2>
+            </div>
+            <button id="details-close" class="icon-button" aria-label="Close">x</button>
+          </div>
+          <p id="details-summary"></p>
+          <div id="details-meta" class="meta-row"></div>
+          <div class="details-actions">
+            <button id="details-play" class="primary-button">Play</button>
+            <button id="details-start-over" class="secondary-button" hidden>Start over</button>
+            <button id="details-open" class="secondary-button">Open</button>
+            <button id="details-previous-episode" class="secondary-button" hidden>Previous episode</button>
+            <button id="details-next-episode" class="secondary-button" hidden>Next episode</button>
+            <button id="details-subtitles" class="secondary-button">Subtitles</button>
+            <button id="details-watch-state" class="secondary-button">Mark watched</button>
+            <button id="details-my-list" class="secondary-button">Add to My List</button>
+            <button id="details-play-queue" class="secondary-button">Add to Queue</button>
+            <button id="details-collections" class="secondary-button" hidden>Collections</button>
+            <button id="details-fix-match" class="secondary-button" hidden>Fix match</button>
+            <button id="details-refresh-metadata" class="secondary-button" hidden>Refresh metadata</button>
+            <button id="details-delete-media" class="secondary-button danger-button" hidden>Delete from disk</button>
+          </div>
+        </section>
+      </div>
+    </dialog>
+
+    <dialog id="device-downloads-dialog" class="device-downloads-dialog" aria-labelledby="device-downloads-title">
+      <header class="device-downloads-head">
+        <div>
+          <p>Offline storage</p>
+          <h2 id="device-downloads-title">Downloads</h2>
+        </div>
+        <button id="device-downloads-close" class="icon-button" type="button" aria-label="Close">x</button>
+      </header>
+      <section class="device-storage-overview" aria-label="Browser storage">
+        <div>
+          <strong id="device-downloads-total">Loading downloads...</strong>
+          <span id="device-downloads-free"></span>
+        </div>
+        <div class="device-storage-meter" aria-hidden="true">
+          <span id="device-downloads-meter"></span>
+        </div>
+      </section>
+      <div class="device-downloads-toolbar">
+        <div>
+          <button id="device-downloads-select-all" class="secondary-button" type="button">Select all</button>
+          <button id="device-downloads-clear" class="secondary-button" type="button">Clear</button>
+        </div>
+        <strong id="device-downloads-selection">0 selected</strong>
+      </div>
+      <div id="device-downloads-status" class="device-downloads-status" aria-live="polite"></div>
+      <section id="device-downloads-list" class="device-downloads-list" aria-live="polite"></section>
+      <footer class="device-downloads-actions">
+        <button id="device-downloads-done" class="secondary-button" type="button">Close</button>
+        <button id="device-downloads-remove" class="danger-button" type="button" disabled>Remove selected</button>
+      </footer>
+    </dialog>
+
+    <dialog id="device-downloads-confirm" class="device-downloads-confirm" aria-labelledby="device-downloads-confirm-title">
+      <h2 id="device-downloads-confirm-title">Remove download?</h2>
+      <p id="device-downloads-confirm-message"></p>
+      <div class="device-downloads-confirm-actions">
+        <button id="device-downloads-confirm-cancel" class="secondary-button" type="button">Cancel</button>
+        <button id="device-downloads-confirm-remove" class="danger-button" type="button">Remove</button>
+      </div>
+    </dialog>
+
+    <dialog id="match-dialog" class="match-dialog">
+      <header class="match-head">
+        <div>
+          <p>Plex metadata</p>
+          <h2 id="match-title">Fix match</h2>
+        </div>
+        <button id="match-close" class="icon-button" type="button" aria-label="Close">x</button>
+      </header>
+      <form id="match-form" class="match-form">
+        <label for="match-query">
+          <span>Title or external ID</span>
+          <input id="match-query" type="search" maxlength="200" autocomplete="off" required />
+        </label>
+        <label for="match-year">
+          <span>Year</span>
+          <input id="match-year" type="number" min="1800" max="2200" inputmode="numeric" autocomplete="off" />
+        </label>
+        <label for="match-language">
+          <span>Language</span>
+          <select id="match-language">
+            <option value="el-GR">Greek</option>
+            <option value="en-US">English</option>
+          </select>
+        </label>
+        <button id="match-search" type="submit" class="primary-button">Search</button>
+      </form>
+      <div id="match-status" class="match-status" aria-live="polite"></div>
+      <section id="match-results" class="match-results" aria-live="polite"></section>
+    </dialog>
+
+    <dialog id="media-delete-dialog" class="media-delete-dialog">
+      <form id="media-delete-form">
+        <header class="media-delete-head">
+          <div>
+            <p>Permanent deletion</p>
+            <h2 id="media-delete-title">Delete from disk?</h2>
+          </div>
+          <button id="media-delete-close" class="icon-button" type="button" aria-label="Close">x</button>
+        </header>
+        <div id="media-delete-status" class="media-delete-status" aria-live="polite">Inspecting files...</div>
+        <div id="media-delete-plan" hidden>
+          <p id="media-delete-summary" class="media-delete-summary"></p>
+          <section id="media-delete-paths" class="media-delete-paths" aria-label="Files and folders to delete"></section>
+          <ul id="media-delete-warnings" class="media-delete-warnings"></ul>
+          <label class="media-delete-confirm-field" for="media-delete-confirmation">
+            <span>Type <strong>DELETE</strong> to confirm</span>
+            <input id="media-delete-confirmation" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" />
+          </label>
+        </div>
+        <div class="media-delete-actions">
+          <button id="media-delete-cancel" type="button" class="secondary-button">Cancel</button>
+          <button id="media-delete-submit" type="submit" class="danger-button" disabled>Delete permanently</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="collection-dialog" class="collection-dialog">
+      <header class="collection-head">
+        <div>
+          <p>Plex collections</p>
+          <h2 id="collection-title">Manage collections</h2>
+        </div>
+        <button id="collection-close" class="icon-button" aria-label="Close">x</button>
+      </header>
+      <form id="collection-create-form" class="collection-create-form">
+        <input id="collection-create-title" type="text" maxlength="120" placeholder="New collection name" autocomplete="off" />
+        <button id="collection-create" type="submit" class="primary-button">Create</button>
+      </form>
+      <input id="collection-filter" type="search" placeholder="Filter collections" autocomplete="off" />
+      <div id="collection-status" class="collection-status" aria-live="polite"></div>
+      <section id="collection-list" class="collection-list" aria-live="polite"></section>
+    </dialog>
+
+    <dialog id="collection-name-dialog" class="collection-name-dialog">
+      <form id="collection-name-form">
+        <h2>Rename collection</h2>
+        <label for="collection-name-input">Collection name</label>
+        <input id="collection-name-input" type="text" maxlength="120" autocomplete="off" required />
+        <div id="collection-name-status" class="collection-status" aria-live="polite"></div>
+        <div class="collection-name-actions">
+          <button id="collection-name-cancel" type="button" class="secondary-button">Cancel</button>
+          <button id="collection-name-save" type="submit" class="primary-button">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="player-dialog" class="player-dialog">
+      <header>
+        <strong id="player-title"></strong>
+        <div class="player-controls">
+          <span id="playback-mode" class="playback-mode"></span>
+          <label for="playback-speed">Speed</label>
+          <select id="playback-speed" aria-label="Playback speed">
+            <option value="0.75">0.75x</option>
+            <option value="1">1x</option>
+            <option value="1.25">1.25x</option>
+            <option value="1.5">1.5x</option>
+            <option value="2">2x</option>
+          </select>
+          <label id="subtitle-select-label" for="subtitle-select">Subtitles</label>
+          <select id="subtitle-select"></select>
+          <span id="subtitle-load-status" class="subtitle-load-status" role="status" hidden></span>
+          <button id="player-start-over" class="secondary-button" type="button" hidden>Start over</button>
+          <button id="player-device-save" class="secondary-button" type="button" hidden>Save offline</button>
+          <button id="player-device-delete" class="secondary-button danger-button" type="button" hidden>Delete offline</button>
+          <button id="player-save" class="secondary-button" type="button" hidden>Prepare stream</button>
+          <button id="player-delete-save" class="secondary-button danger-button" type="button" hidden>Delete stream</button>
+          <button id="player-download-original" class="secondary-button" type="button" hidden>Original ZIP</button>
+          <button id="player-subtitle-search" class="secondary-button" type="button" hidden>Find</button>
+          <label id="autoplay-next-label" class="toggle-field" hidden>
+            <input id="autoplay-next" type="checkbox" />
+            <span>Auto next</span>
+          </label>
+          <button id="player-next-episode" class="secondary-button" type="button" hidden>Next episode</button>
+          <button id="player-close" class="icon-button" aria-label="Close">x</button>
+        </div>
+      </header>
+      <div class="player-stage">
+        <video id="player" controls playsinline webkit-playsinline preload="auto"></video>
+        <button id="player-skip-intro" class="skip-intro-button" type="button" hidden>Skip intro</button>
+      </div>
+      <div id="player-error" class="player-error" role="alert" hidden></div>
+      <div id="player-up-next" class="up-next-banner" hidden>
+        <strong id="player-up-next-text"></strong>
+        <button id="player-up-next-cancel" class="secondary-button" type="button">Cancel</button>
+      </div>
+    </dialog>
+
+    <dialog id="subtitle-dialog" class="subtitle-dialog">
+      <header class="subtitle-head">
+        <div>
+          <p>Subtitles</p>
+          <h2>Choose subtitles</h2>
+        </div>
+        <button id="subtitle-close" class="icon-button" aria-label="Close">x</button>
+      </header>
+      <section class="subtitle-available" aria-labelledby="subtitle-available-heading">
+        <div class="subtitle-section-heading">
+          <h3 id="subtitle-available-heading">Available subtitles</h3>
+          <span id="subtitle-saved-count" class="subtitle-count"></span>
+        </div>
+        <div id="subtitle-saved-status" class="subtitle-saved-status" aria-live="polite"></div>
+        <div id="subtitle-saved-list" class="subtitle-saved-list"></div>
+      </section>
+      <section class="subtitle-search" aria-labelledby="subtitle-search-heading">
+        <div class="subtitle-section-heading subtitle-search-heading">
+          <div>
+            <p>OpenSubtitles</p>
+            <h3 id="subtitle-search-heading">Find new subtitles</h3>
+          </div>
+        </div>
+        <form id="subtitle-form" class="subtitle-form">
+          <select id="subtitle-language" aria-label="Language">
+            <option value="el">Greek</option>
+            <option value="en">English</option>
+            <option value="all">All languages</option>
+          </select>
+          <input id="subtitle-query" type="search" placeholder="Title or release" autocomplete="off" />
+          <button type="submit" class="primary-button">Search</button>
+        </form>
+        <div id="subtitle-status" class="subtitle-status" aria-live="polite"></div>
+        <section id="subtitle-results" class="subtitle-results" aria-live="polite"></section>
+      </section>
+    </dialog>
+
+    <script src="/app.js?v=__APP_VERSION__" type="module"></script>
+  </body>
+</html>

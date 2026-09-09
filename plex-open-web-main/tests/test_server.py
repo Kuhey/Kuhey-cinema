@@ -1,0 +1,2217 @@
+import gzip
+import io
+import json
+import os
+import random
+import threading
+import time
+import unittest
+import tempfile
+import urllib.error
+import urllib.parse
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from unittest import mock
+
+import server
+
+
+class FakeResponse:
+    def getcode(self):
+        return 200
+
+    def close(self):
+        return None
+
+
+class FakeBytesResponse(FakeResponse):
+    def __init__(self, body=b"", status=200, headers=None):
+        self.body = body
+        self.status = status
+        self.headers = headers or {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+    def read(self, _size=-1):
+        return self.body
+
+
+class FakePlex:
+    def __init__(self):
+        self.xml_calls = []
+        self.open_calls = []
+
+    def xml(self, path, params=None):
+        self.xml_calls.append((path, dict(params or {})))
+        if path == "/library/sections":
+            return ET.fromstring(
+                '<MediaContainer size="1"><Directory key="7" title="Movies" type="movie" /></MediaContainer>'
+            )
+        if path.endswith("/genre"):
+            return ET.fromstring(
+                '<MediaContainer size="2">'
+                '<Directory key="22" title="Drama" />'
+                '<Directory key="11" title="Action" />'
+                '</MediaContainer>'
+            )
+        if path.endswith("/collections"):
+            return ET.fromstring(
+                '<MediaContainer size="2" totalSize="9">'
+                '<Directory ratingKey="101" key="/library/collections/101/children" type="collection" '
+                'title="A Collection" childCount="4" thumb="/library/collections/101/composite/1?width=400&amp;height=600" />'
+                '<Directory ratingKey="102" key="/library/collections/102/children" type="collection" '
+                'title="B Collection" childCount="7" />'
+                '</MediaContainer>'
+            )
+        if path.endswith("/all"):
+            index = int((params or {}).get("X-Plex-Container-Start", 0))
+            return ET.fromstring(
+                f'<MediaContainer size="1" totalSize="3">'
+                f'<Video ratingKey="{100 + index}" type="movie" title="Pick {index}" duration="600000">'
+                f'<Media videoCodec="h264" audioCodec="aac"><Part key="/library/parts/{100 + index}/file.mp4" /></Media>'
+                f'</Video></MediaContainer>'
+            )
+        if path.startswith("/library/metadata/"):
+            rating_keys = path.rsplit("/", 1)[-1].split(",")
+            videos = "".join(
+                f'<Video ratingKey="{rating_key}" librarySectionID="{8 if rating_key == "202" else 7}" '
+                f'type="movie" title="Test {rating_key}" duration="600000" />'
+                for rating_key in rating_keys
+            )
+            return ET.fromstring(
+                f'<MediaContainer size="{len(rating_keys)}">{videos}</MediaContainer>'
+            )
+        if path.endswith("/onDeck"):
+            return ET.fromstring(
+                '<MediaContainer size="2" totalSize="2">'
+                '<Video ratingKey="41" type="movie" title="Continue" duration="600000" viewOffset="120000" />'
+                '<Video ratingKey="42" type="movie" title="Finished" duration="600000" viewCount="1" />'
+                '</MediaContainer>'
+            )
+        return ET.fromstring('<MediaContainer size="0" totalSize="0" />')
+
+    def open(self, path, params=None, **kwargs):
+        self.open_calls.append((path, dict(params or {}), dict(kwargs)))
+        return FakeResponse()
+
+
+class FakeEpisodePlex(FakePlex):
+    def xml(self, path, params=None):
+        self.xml_calls.append((path, dict(params or {})))
+        if path == "/library/metadata/12":
+            return ET.fromstring(
+                '<MediaContainer size="1">'
+                '<Video ratingKey="12" type="episode" title="Season Finale" index="2" parentIndex="1" '
+                'parentRatingKey="20" grandparentRatingKey="10" grandparentTitle="Test Show" />'
+                '</MediaContainer>'
+            )
+        if path == "/library/metadata/13":
+            return ET.fromstring(
+                '<MediaContainer size="1">'
+                '<Video ratingKey="13" type="episode" title="New Season" index="1" parentIndex="2" '
+                'parentRatingKey="21" grandparentRatingKey="10" grandparentTitle="Test Show" />'
+                '</MediaContainer>'
+            )
+        if path == "/library/metadata/10/allLeaves":
+            return ET.fromstring(
+                '<MediaContainer size="3" librarySectionID="7">'
+                '<Video ratingKey="11" type="episode" title="Pilot" index="1" parentIndex="1" '
+                'parentRatingKey="20" grandparentRatingKey="10" grandparentTitle="Test Show" />'
+                '<Video ratingKey="12" type="episode" title="Season Finale" index="2" parentIndex="1" '
+                'parentRatingKey="20" grandparentRatingKey="10" grandparentTitle="Test Show" />'
+                '<Video ratingKey="13" type="episode" title="New Season" index="1" parentIndex="2" '
+                'parentRatingKey="21" grandparentRatingKey="10" grandparentTitle="Test Show" />'
+                '</MediaContainer>'
+            )
+        return super().xml(path, params=params)
+
+
+class FakeSubtitleSelectionPlex(FakePlex):
+    def xml(self, path, params=None):
+        self.xml_calls.append((path, dict(params or {})))
+        if path == "/library/metadata/801":
+            return ET.fromstring(
+                '<MediaContainer size="1">'
+                '<Video ratingKey="801" type="movie" title="Subtitle Test">'
+                '<Media><Part id="901" key="/library/parts/901/file.mkv">'
+                '<Stream id="1001" streamType="3" codec="srt" languageCode="ell" />'
+                '<Stream id="1002" streamType="3" codec="srt" languageCode="eng" />'
+                '</Part></Media></Video></MediaContainer>'
+            )
+        return super().xml(path, params=params)
+
+
+class FakeCollectionPlex(FakePlex):
+    def __init__(self, member=False):
+        super().__init__()
+        self.member_keys = {"101"} if member else set()
+        self.collections = [
+            {"ratingKey": "101", "title": "Manual Picks", "childCount": 4, "smart": False},
+            {"ratingKey": "102", "title": "Automatic Picks", "childCount": 8, "smart": True},
+        ]
+
+    def xml(self, path, params=None):
+        self.xml_calls.append((path, dict(params or {})))
+        if path == "/":
+            return ET.fromstring('<MediaContainer machineIdentifier="machine-123" />')
+        if path == "/library/metadata/501":
+            tags = "".join(
+                f'<Collection id="tag-{item["ratingKey"]}" tag="{item["title"]}" />'
+                for item in self.collections
+                if item["ratingKey"] in self.member_keys
+            )
+            return ET.fromstring(
+                '<MediaContainer size="1">'
+                '<Video ratingKey="501" librarySectionID="7" type="movie" title="Collection Test">'
+                f'{tags}</Video></MediaContainer>'
+            )
+        if path == "/library/metadata/601":
+            return ET.fromstring(
+                '<MediaContainer size="1">'
+                '<Video ratingKey="601" librarySectionID="7" type="episode" title="Not a movie" />'
+                '</MediaContainer>'
+            )
+        if path == "/library/sections/7/collections":
+            directories = "".join(
+                '<Directory ratingKey="{ratingKey}" key="/library/collections/{ratingKey}/children" '
+                'type="collection" subtype="movie" title="{title}" childCount="{childCount}"{smart_attr} />'.format(
+                    ratingKey=item["ratingKey"],
+                    title=item["title"],
+                    childCount=item["childCount"],
+                    smart_attr=' smart="1"' if item["smart"] else "",
+                )
+                for item in self.collections
+            )
+            return ET.fromstring(
+                f'<MediaContainer size="{len(self.collections)}">{directories}</MediaContainer>'
+            )
+        return ET.fromstring('<MediaContainer size="0" />')
+
+    def open(self, path, params=None, **kwargs):
+        response = super().open(path, params=params, **kwargs)
+        method = kwargs.get("method")
+        if path == "/library/collections/101/items" and method == "PUT":
+            self.member_keys.add("101")
+        elif path == "/library/collections/101/items/501" and method == "DELETE":
+            self.member_keys.discard("101")
+        elif path == "/library/collections" and method == "POST":
+            self.collections.append(
+                {
+                    "ratingKey": "103",
+                    "title": params["title"],
+                    "childCount": 1,
+                    "smart": False,
+                }
+            )
+            self.member_keys.add("103")
+        elif path == "/library/sections/7/all" and method == "PUT":
+            target = next(item for item in self.collections if item["ratingKey"] == params["id"])
+            target["title"] = params["title.value"]
+        elif path.startswith("/library/collections/") and method == "DELETE":
+            rating_key = path.rsplit("/", 1)[-1]
+            self.collections = [item for item in self.collections if item["ratingKey"] != rating_key]
+            self.member_keys.discard(rating_key)
+        return response
+
+
+class FakeMatchPlex(FakePlex):
+    def __init__(self):
+        super().__init__()
+        self.current_guid = "plex://movie/current123"
+        self.current_title = "Wrong Movie"
+        self.current_year = "1999"
+        self.current_thumb = "/library/metadata/701/thumb/1"
+        self.current_summary = "Current summary"
+        self.current_updated_at = "100"
+
+    def xml(self, path, params=None):
+        self.xml_calls.append((path, dict(params or {})))
+        if path == "/library/sections":
+            return ET.fromstring(
+                '<MediaContainer size="2"><Directory key="7" title="Movies" type="movie" '
+                'agent="tv.plex.agents.movie" scanner="Plex Movie" language="en-US" />'
+                '<Directory key="8" title="Shows" type="show" agent="tv.plex.agents.series" '
+                'scanner="Plex TV Series" language="en-US" />'
+                '</MediaContainer>'
+            )
+        if path == "/library/metadata/701":
+            return ET.fromstring(
+                '<MediaContainer size="1">'
+                f'<Video ratingKey="701" librarySectionID="7" type="movie" guid="{self.current_guid}" '
+                f'title="{self.current_title}" year="{self.current_year}" thumb="{self.current_thumb}" '
+                f'summary="{self.current_summary}" updatedAt="{self.current_updated_at}">'
+                '<Media videoCodec="h264" audioCodec="aac"><Part key="/library/parts/701/file.mp4" /></Media>'
+                '</Video></MediaContainer>'
+            )
+        if path == "/library/metadata/702":
+            return ET.fromstring(
+                '<MediaContainer size="1"><Video ratingKey="702" librarySectionID="7" '
+                'type="episode" title="Episode" /></MediaContainer>'
+            )
+        if path == "/library/metadata/703":
+            return ET.fromstring(
+                '<MediaContainer size="1"><Directory ratingKey="703" librarySectionID="8" '
+                'type="show" guid="plex://show/current789" title="Wrong Show" year="2010" />'
+                '</MediaContainer>'
+            )
+        if path == "/library/metadata/701/matches":
+            return ET.fromstring(
+                '<MediaContainer size="2">'
+                '<SearchResult guid="plex://movie/correct456" name="Correct Movie" year="2024" '
+                'type="movie" summary="Correct summary" thumb="https://images.plex.tv/poster.jpg" />'
+                '<SearchResult guid="plex://movie/current123" name="Wrong Movie" year="1999" '
+                'type="movie" summary="Current summary" />'
+                '</MediaContainer>'
+            )
+        if path == "/library/metadata/703/matches":
+            return ET.fromstring(
+                '<MediaContainer size="1"><SearchResult guid="plex://show/correct987" '
+                'name="Correct Show" year="2011" type="show" summary="Correct show summary" />'
+                '</MediaContainer>'
+            )
+        return ET.fromstring('<MediaContainer size="0" />')
+
+    def open(self, path, params=None, **kwargs):
+        self.open_calls.append((path, dict(params or {}), dict(kwargs)))
+        if path == "/library/metadata/701/match" and kwargs.get("method") == "PUT":
+            self.current_guid = params["guid"]
+            self.current_title = params["name"]
+            self.current_year = str(params.get("year") or "")
+        elif path == "/library/metadata/701/posters" and kwargs.get("method") == "POST":
+            self.current_thumb = "/library/metadata/701/thumb/2"
+        elif path == "/library/metadata/701/refresh" and kwargs.get("method") == "PUT":
+            self.current_summary = "Refreshed summary"
+            self.current_updated_at = "101"
+        return FakeResponse()
+
+
+def handler_with_payload(payload):
+    server.API_CACHE.clear()
+    handler = object.__new__(server.AppHandler)
+    responses = []
+    handler.read_json = lambda: payload
+    handler.send_json = lambda body, status=200, headers=None, **kwargs: responses.append((status, body))
+    return handler, responses
+
+
+class PerformancePathTests(unittest.TestCase):
+    def setUp(self):
+        server.API_CACHE.clear()
+
+    def test_image_urls_request_right_sized_cacheable_artwork(self):
+        url = server.image_url("/library/metadata/42/thumb/123")
+        raw_path = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)["path"][0]
+        path, params = server.plex_image_request(raw_path)
+
+        self.assertEqual("/library/metadata/42/thumb/123", path)
+        self.assertEqual(str(server.POSTER_WIDTH), params["width"])
+        self.assertEqual(str(server.POSTER_HEIGHT), params["height"])
+        self.assertEqual("0", params["upscale"])
+        upstream_path, upstream_params = server.plex_image_upstream_request(raw_path)
+        self.assertEqual("/photo/:/transcode", upstream_path)
+        self.assertEqual("/library/metadata/42/thumb/123", upstream_params["url"])
+
+    def test_browse_items_skip_expensive_saved_status_and_guid_work(self):
+        root = ET.fromstring(
+            '<MediaContainer><Video ratingKey="42" type="movie" title="Fast">'
+            '<Guid id="imdb://tt123" />'
+            '<Media><Part key="/library/parts/42/file.mp4" /></Media>'
+            '</Video></MediaContainer>'
+        )
+        with mock.patch.object(server, "saved_playback_status") as saved_status:
+            item = server.items_from_container(root)[0]
+
+        saved_status.assert_not_called()
+        self.assertEqual({"state": "unknown", "ready": False}, item["savedPlayback"])
+        self.assertEqual([], item["guids"])
+
+    def test_result_cache_coalesces_concurrent_identical_loads(self):
+        cache = server.TimedResultCache()
+        barrier = threading.Barrier(6)
+        lock = threading.Lock()
+        calls = 0
+        results = []
+
+        def loader():
+            nonlocal calls
+            with lock:
+                calls += 1
+            time.sleep(0.04)
+            return {"ok": True}
+
+        def worker():
+            barrier.wait()
+            results.append(cache.get_or_load("same", 1.0, loader))
+
+        threads = [threading.Thread(target=worker) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(2)
+
+        self.assertEqual(1, calls)
+        self.assertEqual([{"ok": True}] * 6, results)
+
+    def test_large_json_responses_are_gzipped_when_supported(self):
+        handler = object.__new__(server.AppHandler)
+        handler.headers = {"Accept-Encoding": "gzip, deflate"}
+        handler.command = "GET"
+        handler.wfile = io.BytesIO()
+        response_headers = {}
+        handler.send_response = lambda status: None
+        handler.send_header = lambda key, value: response_headers.__setitem__(key, value)
+        handler.end_headers = lambda: None
+
+        handler.send_json({"items": ["x" * 3000]})
+
+        self.assertEqual("gzip", response_headers["Content-Encoding"])
+        self.assertEqual({"items": ["x" * 3000]}, json.loads(gzip.decompress(handler.wfile.getvalue())))
+
+    def test_bootstrap_combines_server_libraries_and_my_list(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        handler.is_authenticated = lambda: True
+        with mock.patch.object(server, "PLEX", plex), mock.patch.object(
+            server, "my_list_keys", return_value=["101"]
+        ), mock.patch.object(server, "play_queue_keys", return_value=["202"]):
+            handler.api_bootstrap("GET", {})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("0.26.0", responses[0][1]["version"])
+        self.assertTrue(responses[0][1]["authenticated"])
+        self.assertEqual(["101"], responses[0][1]["ratingKeys"])
+        self.assertEqual(["202"], responses[0][1]["queueRatingKeys"])
+        self.assertEqual("Movies", responses[0][1]["libraries"][0]["title"])
+        self.assertEqual(["/library/sections", "/"], [call[0] for call in plex.xml_calls])
+
+    def test_bootstrap_returns_auth_state_without_touching_plex_when_signed_out(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        handler.is_authenticated = lambda: False
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_bootstrap("GET", {"includeBrowse": ["1"]})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertFalse(responses[0][1]["authenticated"])
+        self.assertEqual("0.26.0", responses[0][1]["version"])
+        self.assertEqual([], plex.xml_calls)
+
+    def test_metadata_batch_fetches_multiple_detailed_items_in_one_plex_call(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex), mock.patch.object(
+            server, "my_list_keys", return_value=["101"]
+        ), mock.patch.object(server, "play_queue_keys", return_value=["102"]):
+            handler.api_metadata_batch({"ratingKeys": ["101,102"]})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual(["101", "102"], [item["ratingKey"] for item in responses[0][1]["items"]])
+        self.assertTrue(responses[0][1]["items"][0]["inMyList"])
+        self.assertTrue(responses[0][1]["items"][1]["inPlayQueue"])
+        self.assertEqual(1, len(plex.xml_calls))
+        self.assertEqual("/library/metadata/101,102", plex.xml_calls[0][0])
+
+    def test_metadata_batch_rejects_more_than_twelve_items(self):
+        handler, responses = handler_with_payload({})
+        handler.api_metadata_batch({"ratingKeys": [",".join(str(value) for value in range(13))]})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_rating_keys", responses[0][1]["error"])
+
+
+class IntroAnalysisTests(unittest.TestCase):
+    @staticmethod
+    def words(seed, count):
+        generator = random.Random(seed)
+        return [generator.getrandbits(32) for _ in range(count)]
+
+    def test_native_plex_intro_marker_is_preferred(self):
+        episode = ET.fromstring(
+            '<Video ratingKey="42" type="episode">'
+            '<Marker type="intro" startTimeOffset="31000" endTimeOffset="92000" />'
+            '</Video>'
+        )
+
+        marker = server.native_intro_marker_from_xml(episode)
+
+        self.assertEqual("plex", marker["source"])
+        self.assertEqual(31000, marker["startTimeOffset"])
+        self.assertEqual(92000, marker["endTimeOffset"])
+
+    def test_audio_fingerprint_finds_the_same_intro_after_different_cold_opens(self):
+        common = self.words(9, 480)
+        first = self.words(1, 500) + common + self.words(2, 900)
+        second_common = [word ^ 0x00010001 for word in common]
+        second = self.words(3, 800) + second_common + self.words(4, 600)
+
+        markers = server.detect_intro_markers(
+            {"first": first, "second": second},
+            {"first": 600000, "second": 600000},
+        )
+
+        self.assertEqual({"first", "second"}, set(markers))
+        self.assertAlmostEqual(65000, markers["first"]["startTimeOffset"], delta=2500)
+        self.assertAlmostEqual(102000, markers["second"]["startTimeOffset"], delta=2500)
+        self.assertGreater(markers["second"]["confidence"], 0.8)
+
+    def test_unrelated_episode_audio_does_not_create_a_marker(self):
+        markers = server.detect_intro_markers(
+            {"first": self.words(11, 1800), "second": self.words(22, 1800)},
+            {"first": 600000, "second": 600000},
+        )
+
+        self.assertEqual({}, markers)
+
+
+class PlaybackCompatibilityTests(unittest.TestCase):
+    def tearDown(self):
+        with server.PLEX_HLS_SESSIONS_LOCK:
+            server.PLEX_HLS_SESSIONS.clear()
+
+    def test_hevc_video_and_eac3_audio_use_the_full_compatibility_stream(self):
+        playback = server.playback_info(
+            "/library/parts/42/file.mkv",
+            {"videoCodec": "hevc", "audioCodec": "eac3"},
+        )
+
+        self.assertTrue(playback["compatibilityTranscodeRequired"])
+        self.assertTrue(playback["videoTranscodeRequired"])
+        self.assertTrue(playback["audioTranscodeRequired"])
+        self.assertIn("video=h264", playback["compatibleStreamUrl"])
+
+    def test_hevc_video_with_aac_audio_still_uses_the_compatibility_stream(self):
+        playback = server.playback_info(
+            "/library/parts/42/file.mkv",
+            {"videoCodec": "hevc", "audioCodec": "aac"},
+        )
+
+        self.assertTrue(playback["compatibilityTranscodeRequired"])
+        self.assertTrue(playback["videoTranscodeRequired"])
+        self.assertFalse(playback["audioTranscodeRequired"])
+        self.assertIn("video=h264", playback["compatibleStreamUrl"])
+
+    def test_compatibility_stream_carries_rating_key_for_seekable_vod(self):
+        playback = server.playback_info(
+            "/library/parts/42/file.mkv",
+            {"videoCodec": "h264", "audioCodec": "ac3"},
+            "701",
+        )
+
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(playback["compatibleStreamUrl"]).query
+        )
+        self.assertEqual(["701"], query["ratingKey"])
+
+    def test_direct_play_version_wins_when_subtitle_preference_is_equal(self):
+        item = ET.fromstring(
+            '<Video ratingKey="701">'
+            '<Media container="mkv" videoCodec="h264" audioCodec="dca">'
+            '<Part id="1" key="/library/parts/1/first.mkv">'
+            '<Stream id="11" streamType="3" codec="srt" selected="1" '
+            'key="/library/streams/11" languageCode="ell" />'
+            '</Part></Media>'
+            '<Media container="mp4" videoCodec="h264" audioCodec="aac" optimizedForStreaming="1">'
+            '<Part id="2" key="/library/parts/2/second.mp4">'
+            '<Stream id="12" streamType="3" codec="srt" selected="1" '
+            'key="/library/streams/12" languageCode="ell" />'
+            '</Part></Media>'
+            '</Video>'
+        )
+
+        part_key, media, subtitles = server.first_part(item)
+
+        self.assertEqual("/library/parts/2/second.mp4", part_key)
+        self.assertEqual("aac", media["audioCodec"])
+        self.assertEqual("12", subtitles[0]["id"])
+        self.assertFalse(server.playback_info(part_key, media)["compatibilityTranscodeRequired"])
+
+    def test_preferred_subtitle_still_wins_over_direct_play_version(self):
+        item = ET.fromstring(
+            '<Video ratingKey="701">'
+            '<Media container="mkv" videoCodec="h264" audioCodec="dca">'
+            '<Part id="1" key="/library/parts/1/first.mkv">'
+            '<Stream id="11" streamType="3" codec="srt" selected="1" '
+            'key="/library/streams/11" languageCode="ell" />'
+            '</Part></Media>'
+            '<Media container="mp4" videoCodec="h264" audioCodec="aac" optimizedForStreaming="1">'
+            '<Part id="2" key="/library/parts/2/second.mp4" />'
+            '</Media>'
+            '</Video>'
+        )
+
+        part_key, media, subtitles = server.first_part(item)
+
+        self.assertEqual("/library/parts/1/first.mkv", part_key)
+        self.assertEqual("dca", media["audioCodec"])
+        self.assertEqual("11", subtitles[0]["id"])
+
+    def test_live_audio_transcode_uses_a_safari_compatible_mp4_header(self):
+        with mock.patch.object(server.PLEX, "_url", return_value="http://plex/media"):
+            command = server.compatible_stream_command("/library/parts/42/file.mkv")
+
+        movflags = command[command.index("-movflags") + 1]
+        self.assertIn("delay_moov", movflags)
+        self.assertNotIn("empty_moov", movflags)
+        self.assertEqual("copy", command[command.index("-c:v") + 1])
+        self.assertEqual("aac", command[command.index("-c:a") + 1])
+        self.assertEqual("pipe:1", command[-1])
+
+    def test_remote_compatible_stream_still_transcodes_video_to_480p(self):
+        with mock.patch.object(server.PLEX, "_url", return_value="http://plex/media"):
+            command = server.compatible_stream_command("/library/parts/42/file.mkv", True)
+
+        self.assertEqual("scale=-2:480", command[command.index("-vf") + 1])
+        self.assertEqual("libx264", command[command.index("-c:v") + 1])
+        self.assertEqual("96k", command[command.index("-b:a") + 1])
+
+    def test_hls_stream_uses_bounded_event_segments_for_native_safari_playback(self):
+        with mock.patch.object(server.PLEX, "_url", return_value="http://plex/media"):
+            command = server.hls_stream_command(
+                "/library/parts/42/file.mkv",
+                Path("/tmp/hls-test"),
+            )
+
+        self.assertEqual("copy", command[command.index("-c:v") + 1])
+        self.assertEqual("aac", command[command.index("-c:a") + 1])
+        self.assertEqual("4", command[command.index("-hls_time") + 1])
+        self.assertEqual("event", command[command.index("-hls_playlist_type") + 1])
+        self.assertEqual("mpegts", command[command.index("-hls_segment_type") + 1])
+        self.assertIn("temp_file", command[command.index("-hls_flags") + 1])
+
+    def test_hls_stream_converts_unsupported_video_to_browser_safe_h264(self):
+        with mock.patch.object(server.PLEX, "_url", return_value="http://plex/media"):
+            command = server.hls_stream_command(
+                "/library/parts/42/file.mkv",
+                Path("/tmp/hls-test"),
+                transcode_video=True,
+            )
+
+        self.assertEqual("libx264", command[command.index("-c:v") + 1])
+        self.assertEqual("yuv420p", command[command.index("-pix_fmt") + 1])
+        self.assertEqual("aac", command[command.index("-c:a") + 1])
+
+    def test_hls_cache_separates_copied_and_transcoded_video(self):
+        copied = server.hls_stream_id("/library/parts/42/file.mkv")
+        transcoded = server.hls_stream_id(
+            "/library/parts/42/file.mkv",
+            transcode_video=True,
+        )
+
+        self.assertNotEqual(copied, transcoded)
+
+    def test_hls_manifest_rewrites_only_valid_segment_paths(self):
+        raw = "#EXTM3U\n#EXTINF:4.0,\nsegment-00000.ts\n#EXT-X-ENDLIST\n"
+        manifest = server.hls_manifest_text("a" * 24, raw)
+
+        self.assertIn("#EXT-X-START:TIME-OFFSET=0,PRECISE=YES", manifest)
+        self.assertIn("/api/hls-segment?id=" + "a" * 24, manifest)
+        self.assertIn("name=segment-00000.ts", manifest)
+        with self.assertRaises(ValueError):
+            server.hls_manifest_text("a" * 24, "#EXTM3U\n../outside.ts\n")
+
+    def test_plex_hls_profile_requests_timestamp_aligned_h264_aac_vod(self):
+        params = server.plex_hls_transcode_params(
+            "701",
+            "a" * 32,
+            media_index=2,
+            part_index=1,
+        )
+
+        self.assertEqual("/library/metadata/701", params["path"])
+        self.assertEqual("2", params["mediaIndex"])
+        self.assertEqual("1", params["partIndex"])
+        self.assertEqual("hls", params["protocol"])
+        self.assertEqual("1", params["fastSeek"])
+        self.assertEqual("0", params["directStream"])
+        self.assertEqual("0", params["directStreamAudio"])
+        self.assertEqual("aac", params["audioCodec"])
+        self.assertEqual("none", params["subtitles"])
+
+    def test_media_part_indices_follow_the_selected_part(self):
+        item = ET.fromstring(
+            '<Video ratingKey="701">'
+            '<Media><Part key="/library/parts/1/first.mkv" /></Media>'
+            '<Media><Part key="/library/parts/2/second.mkv" /></Media>'
+            '</Video>'
+        )
+
+        self.assertEqual(
+            (1, 0),
+            server.media_part_indices(item, "/library/parts/2/second.mkv"),
+        )
+
+    def test_plex_hls_manifests_are_rewritten_as_complete_vod(self):
+        session_id = "a" * 32
+        upstream_session_id = "9" * 32
+        master, variants = server.plex_hls_master_text(
+            session_id,
+            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\n"
+            f"session/{upstream_session_id}/base/index.m3u8?X-Plex-Incomplete-Segments=1\n",
+            upstream_session_id,
+        )
+        playlist = server.plex_hls_playlist_text(
+            session_id,
+            "base",
+            "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10, nodesc\n"
+            "00000.ts\n#EXT-X-ENDLIST\n",
+        )
+
+        self.assertEqual({"base"}, variants)
+        self.assertIn("/api/plex-hls-playlist?id=", master)
+        self.assertIn(session_id, master)
+        self.assertNotIn(upstream_session_id, master)
+        self.assertIn("#EXT-X-PLAYLIST-TYPE:VOD", playlist)
+        self.assertIn("/api/plex-hls-segment?id=", playlist)
+        self.assertIn("name=00000.ts", playlist)
+        self.assertIn("#EXT-X-ENDLIST", playlist)
+        with self.assertRaises(RuntimeError):
+            server.plex_hls_playlist_text(
+                session_id,
+                "base",
+                "#EXTM3U\n#EXTINF:10,\n00000.ts\n",
+            )
+        with self.assertRaises(ValueError):
+            server.plex_hls_playlist_text(
+                session_id,
+                "base",
+                "#EXTM3U\n#EXTINF:10,\n../outside.ts\n#EXT-X-ENDLIST\n",
+            )
+
+    def test_plex_hls_session_runs_decision_before_start_and_reuses_result(self):
+        class FakePlexHls:
+            def __init__(self):
+                self.calls = []
+
+            def open(self, path, params=None, **kwargs):
+                self.calls.append((path, dict(params or {}), dict(kwargs)))
+                if path.endswith("/decision"):
+                    return FakeBytesResponse(b'<MediaContainer transcodeDecisionCode="1001" />')
+                if path.endswith("/start.m3u8"):
+                    session_id = params["session"]
+                    return FakeBytesResponse(
+                        (
+                            "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000\n"
+                            f"session/{session_id}/base/index.m3u8\n"
+                        ).encode()
+                    )
+                return FakeBytesResponse()
+
+        plex = FakePlexHls()
+        session_id = "b" * 32
+        with mock.patch.object(server, "PLEX", plex):
+            first = server.ensure_plex_hls_session(session_id, "701")
+            second = server.ensure_plex_hls_session(session_id, "701")
+            stopped = server.stop_plex_hls_session(session_id)
+
+        self.assertIs(first, second)
+        self.assertTrue(stopped)
+        self.assertEqual(
+            [
+                "/video/:/transcode/universal/decision",
+                "/video/:/transcode/universal/start.m3u8",
+                "/video/:/transcode/universal/stop",
+            ],
+            [call[0] for call in plex.calls],
+        )
+
+    def test_stale_plex_hls_session_restarts_with_the_same_playback_identity(self):
+        session_id = "3" * 32
+        failed_upstream_id = "8" * 32
+        event = threading.Event()
+        failed = {
+            "state": "ready",
+            "ratingKey": "701",
+            "remoteQuality": True,
+            "mediaIndex": 2,
+            "partIndex": 1,
+            "variants": {"base"},
+            "upstreamId": failed_upstream_id,
+            "event": event,
+        }
+        replacement = {"state": "ready", "variants": {"base"}}
+        with server.PLEX_HLS_SESSIONS_LOCK:
+            server.PLEX_HLS_SESSIONS[session_id] = failed
+
+        with mock.patch.object(server, "stop_plex_hls_upstream") as stop, mock.patch.object(
+            server, "ensure_plex_hls_session", return_value=replacement
+        ) as ensure:
+            recovered = server.recover_plex_hls_session(session_id, failed)
+
+        self.assertIs(replacement, recovered)
+        self.assertTrue(failed["stopped"])
+        self.assertTrue(event.is_set())
+        stop.assert_called_once_with(failed_upstream_id)
+        self.assertEqual((session_id, "701", True, 2, 1), ensure.call_args.args)
+        replacement_upstream_id = ensure.call_args.kwargs["upstream_session_id"]
+        self.assertRegex(replacement_upstream_id, r"^[a-f0-9]{32}$")
+        self.assertNotEqual(failed_upstream_id, replacement_upstream_id)
+
+    def test_missing_plex_hls_segment_recovers_and_retries_in_the_same_request(self):
+        class SegmentResponse(io.BytesIO):
+            status = 200
+            headers = {"Content-Length": "7", "Content-Type": "video/mp2t"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                self.close()
+                return False
+
+        session_id = "4" * 32
+        replacement_upstream_id = "5" * 32
+        session = {
+            "state": "ready",
+            "ratingKey": "701",
+            "variants": {"base"},
+            "event": threading.Event(),
+        }
+        upstream = mock.Mock()
+        upstream.open.side_effect = [
+            urllib.error.HTTPError("segment", 404, "missing", {}, io.BytesIO()),
+            FakeBytesResponse(
+                b"#EXTM3U\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+                b"#EXTINF:10,\n00000.ts\n#EXT-X-ENDLIST\n"
+            ),
+            SegmentResponse(b"warm-up"),
+            SegmentResponse(b"segment"),
+        ]
+        handler = object.__new__(server.AppHandler)
+        handler.headers = {}
+        handler.wfile = io.BytesIO()
+        statuses = []
+        json_responses = []
+        handler.require_auth = lambda: None
+        handler.send_response = statuses.append
+        handler.send_header = lambda key, value: None
+        handler.end_headers = lambda: None
+        handler.send_json = lambda body, status=200, **kwargs: json_responses.append((status, body))
+
+        with mock.patch.object(server, "PLEX", upstream), mock.patch.object(
+            server, "active_plex_hls_session", return_value=session
+        ), mock.patch.object(
+            server,
+            "recover_plex_hls_session",
+            return_value={"variants": {"base"}, "upstreamId": replacement_upstream_id},
+        ) as recover:
+            handler.handle_plex_hls_segment(
+                "GET",
+                {"id": [session_id], "variant": ["base"], "name": ["00042.ts"]},
+            )
+
+        self.assertEqual([200], statuses)
+        self.assertEqual(b"segment", handler.wfile.getvalue())
+        self.assertEqual([], json_responses)
+        self.assertEqual(4, upstream.open.call_count)
+        self.assertIn(
+            f"/session/{replacement_upstream_id}/base/index.m3u8",
+            upstream.open.call_args_list[1].args[0],
+        )
+        self.assertIn(
+            f"/session/{replacement_upstream_id}/base/00000.ts",
+            upstream.open.call_args_list[2].args[0],
+        )
+        self.assertIn(
+            f"/session/{replacement_upstream_id}/base/00042.ts",
+            upstream.open.call_args_list[3].args[0],
+        )
+        recover.assert_called_once_with(session_id, session)
+
+    def test_plex_hls_segment_ignores_stale_browser_byte_range(self):
+        class SegmentResponse(io.BytesIO):
+            status = 200
+            headers = {
+                "Content-Length": "7",
+                "Content-Type": "video/mp2t",
+                "Content-Range": "bytes 0-6/7",
+                "Accept-Ranges": "bytes",
+            }
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                self.close()
+                return False
+
+        session_id = "7" * 32
+        session = {
+            "state": "ready",
+            "ratingKey": "701",
+            "variants": {"base"},
+            "event": threading.Event(),
+        }
+        upstream = mock.Mock()
+        upstream.open.return_value = SegmentResponse(b"segment")
+        handler = object.__new__(server.AppHandler)
+        handler.headers = {"Range": "bytes=999999999-"}
+        handler.wfile = io.BytesIO()
+        statuses = []
+        response_headers = []
+        handler.require_auth = lambda: None
+        handler.send_response = statuses.append
+        handler.send_header = lambda key, value: response_headers.append((key, value))
+        handler.end_headers = lambda: None
+        handler.send_json = lambda body, status=200, **kwargs: self.fail(
+            f"Unexpected JSON response {status}: {body}"
+        )
+
+        with mock.patch.object(server, "PLEX", upstream), mock.patch.object(
+            server, "active_plex_hls_session", return_value=session
+        ):
+            handler.handle_plex_hls_segment(
+                "GET",
+                {"id": [session_id], "variant": ["base"], "name": ["00042.ts"]},
+            )
+
+        self.assertEqual([200], statuses)
+        self.assertEqual(b"segment", handler.wfile.getvalue())
+        self.assertNotIn("Range", upstream.open.call_args.kwargs["headers"])
+        self.assertIn(("Accept-Ranges", "none"), response_headers)
+        self.assertFalse(any(key == "Content-Range" for key, _ in response_headers))
+
+    def test_background_hls_stop_schedules_idle_cleanup(self):
+        session_id = "c" * 32
+        session = {
+            "state": "ready",
+            "lastAccess": 100.0,
+            "event": threading.Event(),
+        }
+        with server.PLEX_HLS_SESSIONS_LOCK:
+            server.PLEX_HLS_SESSIONS[session_id] = session
+
+        with mock.patch.object(server.Settings, "hls_background_grace", 120), mock.patch.object(
+            server.time, "monotonic", return_value=100.0
+        ), mock.patch.object(server.threading, "Timer") as timer:
+            deferred = server.defer_plex_hls_session_stop(session_id)
+
+        self.assertTrue(deferred)
+        self.assertRegex(session["idleStopToken"], r"^[a-f0-9]{16}$")
+        self.assertEqual(120.0, timer.call_args.args[0])
+        self.assertIs(server.expire_plex_hls_session_if_idle, timer.call_args.args[1])
+        self.assertEqual(session_id, timer.call_args.kwargs["args"][0])
+        self.assertTrue(timer.return_value.daemon)
+        timer.return_value.start.assert_called_once_with()
+
+    def test_background_hls_stop_accepts_playback_length_with_a_bounded_maximum(self):
+        session_id = "1" * 32
+        session = {
+            "state": "ready",
+            "lastAccess": 100.0,
+            "event": threading.Event(),
+        }
+        with server.PLEX_HLS_SESSIONS_LOCK:
+            server.PLEX_HLS_SESSIONS[session_id] = session
+
+        with mock.patch.object(server.Settings, "hls_background_grace", 120), mock.patch.object(
+            server.Settings, "hls_background_max_grace", 3600
+        ), mock.patch.object(server.time, "monotonic", return_value=100.0), mock.patch.object(
+            server.threading, "Timer"
+        ) as timer:
+            deferred = server.defer_plex_hls_session_stop(session_id, 7200)
+
+        self.assertTrue(deferred)
+        self.assertEqual(3600.0, timer.call_args.args[0])
+
+    def test_deferred_hls_cleanup_tracks_segment_activity(self):
+        session_id = "d" * 32
+        token = "lease"
+        with server.PLEX_HLS_SESSIONS_LOCK:
+            server.PLEX_HLS_SESSIONS[session_id] = {
+                "state": "ready",
+                "lastAccess": 90.0,
+                "idleStopToken": token,
+                "event": threading.Event(),
+            }
+
+        with mock.patch.object(server.time, "monotonic", return_value=100.0), mock.patch.object(
+            server, "schedule_plex_hls_idle_stop"
+        ) as schedule:
+            server.expire_plex_hls_session_if_idle(session_id, token, 60)
+
+        self.assertIn(session_id, server.PLEX_HLS_SESSIONS)
+        schedule.assert_called_once_with(session_id, token, 60, 50.0)
+
+    def test_deferred_hls_cleanup_stops_an_abandoned_session(self):
+        session_id = "e" * 32
+        upstream_session_id = "6" * 32
+        event = threading.Event()
+        with server.PLEX_HLS_SESSIONS_LOCK:
+            server.PLEX_HLS_SESSIONS[session_id] = {
+                "state": "ready",
+                "lastAccess": 10.0,
+                "idleStopToken": "lease",
+                "upstreamId": upstream_session_id,
+                "event": event,
+            }
+
+        with mock.patch.object(server.time, "monotonic", return_value=100.0), mock.patch.object(
+            server, "stop_plex_hls_upstream"
+        ) as stop_upstream:
+            server.expire_plex_hls_session_if_idle(session_id, "lease", 60)
+
+        self.assertNotIn(session_id, server.PLEX_HLS_SESSIONS)
+        self.assertTrue(event.is_set())
+        stop_upstream.assert_called_once_with(upstream_session_id)
+
+    def test_hls_stop_endpoint_can_defer_background_cleanup(self):
+        session_id = "f" * 32
+        handler, responses = handler_with_payload({"id": session_id, "defer": True})
+        handler.require_auth = lambda: None
+
+        with mock.patch.object(server.Settings, "hls_background_grace", 600), mock.patch.object(
+            server.Settings, "hls_background_max_grace", 43200
+        ), mock.patch.object(server, "defer_plex_hls_session_stop", return_value=True) as defer:
+            handler.api_plex_hls_stop("POST")
+
+        defer.assert_called_once_with(session_id, 600)
+        self.assertEqual(
+            (
+                200,
+                {
+                    "ok": True,
+                    "stopped": False,
+                    "deferred": True,
+                    "graceSeconds": 600,
+                },
+            ),
+            responses[0],
+        )
+
+    def test_hls_stop_endpoint_passes_remaining_playback_grace(self):
+        session_id = "2" * 32
+        handler, responses = handler_with_payload(
+            {"id": session_id, "defer": True, "graceSeconds": 5400}
+        )
+        handler.require_auth = lambda: None
+
+        with mock.patch.object(server, "defer_plex_hls_session_stop", return_value=True) as defer:
+            handler.api_plex_hls_stop("POST")
+
+        defer.assert_called_once_with(session_id, 5400)
+        self.assertEqual(5400, responses[0][1]["graceSeconds"])
+
+    def test_pagehide_uses_deferred_hls_release_for_an_open_player(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        start = source.index('window.addEventListener("pagehide"')
+        end = source.index('el.playerSave.addEventListener("click"', start)
+        handler = source[start:end]
+
+        self.assertIn("playerSessionMayResumeAfterPageHide()", handler)
+        self.assertIn("deferActiveHlsSessionStop({ keepalive: true })", handler)
+        self.assertIn('progressState = mayResume && !el.player.paused ? "playing" : "paused"', handler)
+
+    def test_frontend_background_lease_uses_remaining_runtime(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("function backgroundHlsGraceSeconds()", source)
+        self.assertIn("BACKGROUND_HLS_COMPLETION_BUFFER_SECONDS", source)
+        self.assertIn("graceSeconds: Math.ceil(requestedGrace)", source)
+
+    def test_frontend_renews_hls_after_a_long_pause_or_stall(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("HLS_PAUSE_RENEW_AFTER_MS", source)
+        self.assertIn('renewActiveHlsPlayback("paused")', source)
+        self.assertIn('el.player.addEventListener("waiting", scheduleHlsStallRecovery)', source)
+        self.assertIn('el.player.addEventListener("stalled", scheduleHlsStallRecovery)', source)
+        self.assertIn("loadPlayerSource(item, streamUrl, { resumeTime, autoplay: true, recovering: true })", source)
+
+    def test_frontend_renews_hls_when_startup_playback_errors(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        start = source.index('el.player.addEventListener("error"')
+        end = source.index('el.player.addEventListener("pause"', start)
+        handler = source[start:end]
+
+        self.assertIn('renewActiveHlsPlayback("error")', handler)
+        self.assertNotIn("state.playerHasPlayed", handler)
+
+    def test_frontend_does_not_toggle_an_already_active_subtitle_track(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        start = source.index("function setActiveSubtitle")
+        end = source.index("\n}\n", start)
+        function_source = source[start:end]
+
+        self.assertIn("track.mode !== nextMode", function_source)
+        self.assertNotIn("disableAllTextTracks()", function_source)
+
+    def test_frontend_registers_ios_platform_playback_session(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn('navigator.audioSession.type = "playback"', source)
+        self.assertIn("navigator.mediaSession.metadata = new MediaMetadata", source)
+        self.assertIn('navigator.mediaSession.setActionHandler(action, handler)', source)
+        self.assertIn('el.player.addEventListener("enterpictureinpicture"', source)
+
+
+class MediaMatchTests(unittest.TestCase):
+    def setUp(self):
+        server.API_CACHE.clear()
+
+    def test_search_returns_ranked_plex_candidates_with_current_match(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_match(
+                "GET",
+                {
+                    "ratingKey": ["701"],
+                    "title": ["Correct Movie"],
+                    "year": ["2024"],
+                    "language": ["en-US"],
+                },
+            )
+
+        self.assertEqual(200, responses[0][0])
+        payload = responses[0][1]
+        self.assertEqual("plex://movie/current123", payload["currentGuid"])
+        self.assertEqual(2, len(payload["results"]))
+        self.assertTrue(payload["results"][0]["best"])
+        self.assertFalse(payload["results"][0]["current"])
+        self.assertTrue(payload["results"][1]["current"])
+        self.assertEqual("https://images.plex.tv/poster.jpg", payload["results"][0]["posterUrl"])
+        self.assertTrue(payload["results"][0]["posterCanApply"])
+        _, params = next(call for call in plex.xml_calls if call[0].endswith("/matches"))
+        self.assertEqual(1, params["manual"])
+        self.assertEqual("Correct Movie", params["title"])
+        self.assertEqual(2024, params["year"])
+        self.assertEqual("tv.plex.agents.movie", params["agent"])
+        self.assertEqual("en-US", params["language"])
+
+    def test_apply_uses_selected_guid_and_returns_refreshed_metadata(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload(
+            {
+                "ratingKey": "701",
+                "guid": "plex://movie/correct456",
+                "name": "Correct Movie",
+                "year": 2024,
+            }
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_match("POST", {})
+
+        self.assertEqual(200, responses[0][0])
+        payload = responses[0][1]
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["pending"])
+        self.assertEqual("plex://movie/correct456", payload["item"]["guid"])
+        self.assertEqual("Correct Movie", payload["item"]["title"])
+        path, params, kwargs = plex.open_calls[0]
+        self.assertEqual("/library/metadata/701/match", path)
+        self.assertEqual("plex://movie/correct456", params["guid"])
+        self.assertEqual("Correct Movie", params["name"])
+        self.assertEqual(2024, params["year"])
+        self.assertEqual("PUT", kwargs["method"])
+
+    def test_apply_rejects_a_match_for_the_wrong_media_type(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload(
+            {
+                "ratingKey": "701",
+                "guid": "plex://show/wrongtype",
+                "name": "Wrong Type",
+                "year": 2024,
+            }
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_match("POST", {})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_match", responses[0][1]["error"])
+        self.assertEqual([], plex.open_calls)
+
+    def test_apply_poster_changes_only_artwork_from_a_trusted_plex_result(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload(
+            {
+                "ratingKey": "701",
+                "posterUrl": "https://images.plex.tv/poster.jpg",
+            }
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_poster("POST")
+
+        self.assertEqual(200, responses[0][0])
+        payload = responses[0][1]
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["pending"])
+        self.assertEqual("plex://movie/current123", payload["item"]["guid"])
+        self.assertEqual("Wrong Movie", payload["item"]["title"])
+        self.assertIn("thumb%2F2", payload["item"]["posterUrl"])
+        path, params, kwargs = plex.open_calls[0]
+        self.assertEqual("/library/metadata/701/posters", path)
+        self.assertEqual("https://images.plex.tv/poster.jpg", params["url"])
+        self.assertEqual("POST", kwargs["method"])
+
+    def test_apply_poster_rejects_an_untrusted_artwork_host(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload(
+            {
+                "ratingKey": "701",
+                "posterUrl": "https://images.plex.tv.example.com/poster.jpg",
+            }
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_poster("POST")
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_poster_url", responses[0][1]["error"])
+        self.assertEqual([], plex.open_calls)
+
+    def test_refresh_updates_metadata_without_changing_the_match(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload({"ratingKey": "701"})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_refresh("POST")
+
+        self.assertEqual(200, responses[0][0])
+        payload = responses[0][1]
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["pending"])
+        self.assertEqual("plex://movie/current123", payload["item"]["guid"])
+        self.assertEqual("Refreshed summary", payload["item"]["summary"])
+        path, params, kwargs = plex.open_calls[0]
+        self.assertEqual("/library/metadata/701/refresh", path)
+        self.assertEqual({}, params)
+        self.assertEqual("PUT", kwargs["method"])
+
+    def test_refresh_rejects_episode_metadata(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload({"ratingKey": "702"})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_refresh("POST")
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("unsupported_media_type", responses[0][1]["error"])
+        self.assertEqual([], plex.open_calls)
+
+    def test_episode_matching_is_rejected_at_the_api_boundary(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_match("GET", {"ratingKey": ["702"], "title": ["Episode"]})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("unsupported_media_type", responses[0][1]["error"])
+
+    def test_tv_show_search_uses_the_series_agent(self):
+        plex = FakeMatchPlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_media_match(
+                "GET",
+                {"ratingKey": ["703"], "title": ["Correct Show"], "year": ["2011"]},
+            )
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("show", responses[0][1]["type"])
+        self.assertEqual("plex://show/correct987", responses[0][1]["results"][0]["guid"])
+        _, params = next(call for call in plex.xml_calls if call[0].endswith("/matches"))
+        self.assertEqual("tv.plex.agents.series", params["agent"])
+
+
+class LibraryViewTests(unittest.TestCase):
+    def test_library_genres_are_returned_in_title_order(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_library_genres("/api/library/7/genres")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual(
+            [{"key": "11", "title": "Action"}, {"key": "22", "title": "Drama"}],
+            responses[0][1]["genres"],
+        )
+        self.assertEqual("/library/sections/7/genre", plex.xml_calls[0][0])
+
+    def test_library_view_forwards_a_valid_genre_filter(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_library(
+                "/api/library/7",
+                {"view": ["all"], "sort": ["titleSort"], "genre": ["11"]},
+            )
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("11", responses[0][1]["genre"])
+        path, params = plex.xml_calls[0]
+        self.assertEqual("/library/sections/7/all", path)
+        self.assertEqual("11", params["genre"])
+        self.assertEqual("titleSort", params["sort"])
+        self.assertNotIn("includeGuids", params)
+
+    def test_browse_bundle_loads_filters_and_first_page_together(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_browse(
+                "/api/browse/7",
+                {"view": ["all"], "sort": ["addedAt:desc"], "start": ["0"], "limit": ["24"]},
+            )
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("7", responses[0][1]["library"])
+        self.assertEqual("Action", responses[0][1]["genres"][0]["title"])
+        self.assertEqual("Pick 0", responses[0][1]["page"]["items"][0]["title"])
+        self.assertEqual(
+            {"/library/sections/7/genre", "/library/sections/7/all"},
+            {call[0] for call in plex.xml_calls},
+        )
+
+    def test_library_view_rejects_an_invalid_genre_filter(self):
+        handler, responses = handler_with_payload({})
+        handler.api_library("/api/library/7", {"genre": ["../11"]})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_genre", responses[0][1]["error"])
+
+    def test_continue_view_uses_on_deck_and_excludes_watched_items(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_library(
+                "/api/library/7",
+                {"view": ["continue"], "sort": ["addedAt:desc"], "start": ["2"], "limit": ["5"]},
+            )
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("continue", responses[0][1]["view"])
+        self.assertEqual(["41"], [item["ratingKey"] for item in responses[0][1]["items"]])
+        self.assertEqual(1, responses[0][1]["totalSize"])
+        path, params = plex.xml_calls[0]
+        self.assertEqual("/library/sections/7/onDeck", path)
+        self.assertEqual(0, params["X-Plex-Container-Start"])
+        self.assertEqual(300, params["X-Plex-Container-Size"])
+        self.assertNotIn("sort", params)
+
+    def test_collections_view_uses_native_collection_directory(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_library(
+                "/api/library/7",
+                {
+                    "view": ["collections"],
+                    "sort": ["year:desc"],
+                    "genre": ["11"],
+                    "start": ["0"],
+                    "limit": ["2"],
+                },
+            )
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("collections", responses[0][1]["view"])
+        self.assertEqual(9, responses[0][1]["totalSize"])
+        self.assertEqual("collection", responses[0][1]["items"][0]["type"])
+        self.assertEqual(4, responses[0][1]["items"][0]["childCount"])
+        path, params = plex.xml_calls[0]
+        self.assertEqual("/library/sections/7/collections", path)
+        self.assertEqual("titleSort", params["sort"])
+        self.assertEqual(2, params["X-Plex-Container-Size"])
+        self.assertNotIn("genre", params)
+        self.assertIsNone(responses[0][1]["genre"])
+
+    def test_collection_composite_image_query_is_forwarded_safely(self):
+        path, params = server.plex_image_request(
+            "/library/collections/101/composite/1?width=400&height=600&X-Plex-Token=ignored"
+        )
+
+        self.assertEqual("/library/collections/101/composite/1", path)
+        self.assertEqual({"width": "400", "height": "600"}, params)
+
+    def test_random_item_uses_a_single_random_library_offset(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex), mock.patch.object(server.secrets, "randbelow", return_value=2):
+            handler.api_random_item({"sectionKey": ["7"]})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual(3, responses[0][1]["totalSize"])
+        self.assertEqual(2, responses[0][1]["offset"])
+        self.assertEqual("102", responses[0][1]["item"]["ratingKey"])
+        self.assertEqual("/api/stream?partKey=%2Flibrary%2Fparts%2F102%2Ffile.mp4", responses[0][1]["item"]["streamUrl"])
+        self.assertEqual("/library/sections", plex.xml_calls[0][0])
+        self.assertEqual(0, plex.xml_calls[1][1]["X-Plex-Container-Start"])
+        self.assertEqual(2, plex.xml_calls[2][1]["X-Plex-Container-Start"])
+
+    def test_random_item_rejects_an_invalid_library_key(self):
+        handler, responses = handler_with_payload({})
+        handler.api_random_item({"sectionKey": ["../7"]})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_section", responses[0][1]["error"])
+
+    def test_random_item_honors_genre_and_unwatched_filters(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex), mock.patch.object(server.secrets, "randbelow", return_value=1):
+            handler.api_random_item({"sectionKey": ["7"], "genre": ["11"], "unwatched": ["true"]})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("11", responses[0][1]["genre"])
+        self.assertTrue(responses[0][1]["unwatched"])
+        for _, params in plex.xml_calls[1:]:
+            self.assertEqual("11", params["genre"])
+            self.assertEqual("1", params["unwatched"])
+
+
+class PlaybackProgressTests(unittest.TestCase):
+    def test_restart_records_override_without_changing_watched_state(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload(
+            {
+                "ratingKey": "42",
+                "timeMs": 0,
+                "durationMs": 600000,
+                "state": "restarted",
+            }
+        )
+        with mock.patch.object(server, "PLEX", plex), mock.patch.object(
+            server, "record_playback_restart"
+        ) as record_restart:
+            handler.api_playback_progress("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertTrue(responses[0][1]["restarted"])
+        self.assertTrue(responses[0][1]["progressSaved"])
+        self.assertFalse(responses[0][1]["watched"])
+        path, params, kwargs = plex.open_calls[0]
+        self.assertEqual("/:/progress", path)
+        self.assertEqual(0, params["time"])
+        self.assertEqual("PUT", kwargs["method"])
+        record_restart.assert_called_once_with("42", 0)
+
+    def test_short_playback_does_not_overwrite_existing_plex_progress(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload(
+            {
+                "ratingKey": "42",
+                "timeMs": 30000,
+                "durationMs": 600000,
+                "state": "stopped",
+            }
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_playback_progress("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertFalse(responses[0][1]["progressSaved"])
+        self.assertFalse(responses[0][1]["restarted"])
+        self.assertEqual([], plex.open_calls)
+
+    def test_rejects_an_unknown_playback_state(self):
+        handler, responses = handler_with_payload(
+            {
+                "ratingKey": "42",
+                "timeMs": 0,
+                "durationMs": 600000,
+                "state": "rewind-everything",
+            }
+        )
+        handler.api_playback_progress("POST")
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_playback_state", responses[0][1]["error"])
+
+
+class PlaybackRestartOverrideTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.restart_file_patch = mock.patch.object(
+            server,
+            "PLAYBACK_RESTARTS_FILE",
+            Path(self.temporary_directory.name) / "playback-restarts.json",
+        )
+        self.restart_file_patch.start()
+        server.PLAYBACK_RESTARTS_CACHE = None
+
+    def tearDown(self):
+        server.PLAYBACK_RESTARTS_CACHE = None
+        self.restart_file_patch.stop()
+        self.temporary_directory.cleanup()
+
+    def test_restart_override_hides_unchanged_plex_position(self):
+        server.record_playback_restart("42", 180000)
+
+        self.assertEqual(0, server.effective_view_offset("42", 180000))
+        self.assertEqual(0, server.effective_view_offset("42", 205000))
+
+    def test_new_plex_position_releases_restart_override(self):
+        server.record_playback_restart("42", 180000)
+
+        self.assertEqual(240000, server.effective_view_offset("42", 240000))
+        self.assertEqual(240000, server.effective_view_offset("42", 240000))
+
+    def test_restart_override_survives_process_cache_reload(self):
+        server.record_playback_restart("42", 180000)
+        server.PLAYBACK_RESTARTS_CACHE = None
+
+        self.assertEqual(0, server.effective_view_offset("42", 180000))
+
+
+class WatchStateTests(unittest.TestCase):
+    def test_mark_watched_calls_scrobble(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({"ratingKey": "42", "watched": True})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_watch_state("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertTrue(responses[0][1]["watched"])
+        self.assertEqual(1, responses[0][1]["item"]["viewCount"])
+        self.assertEqual("/:/scrobble", plex.open_calls[0][0])
+
+    def test_mark_unwatched_calls_unscrobble_and_clears_progress(self):
+        plex = FakePlex()
+        handler, responses = handler_with_payload({"ratingKey": "42", "watched": False})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_watch_state("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertFalse(responses[0][1]["watched"])
+        self.assertEqual(0, responses[0][1]["item"]["viewCount"])
+        self.assertEqual(0, responses[0][1]["item"]["viewOffset"])
+        self.assertEqual("/:/unscrobble", plex.open_calls[0][0])
+
+    def test_rejects_non_boolean_state(self):
+        handler, responses = handler_with_payload({"ratingKey": "42", "watched": "yes"})
+        handler.api_watch_state("POST")
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_watched_state", responses[0][1]["error"])
+
+
+class SubtitleSelectionTests(unittest.TestCase):
+    def setUp(self):
+        server.API_CACHE.clear()
+
+    def test_selects_a_valid_subtitle_stream_for_the_item_part(self):
+        plex = FakeSubtitleSelectionPlex()
+        handler, responses = handler_with_payload(
+            {"ratingKey": "801", "partId": "901", "streamId": "1002"}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_subtitle_selection("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("1002", responses[0][1]["streamId"])
+        self.assertFalse(responses[0][1]["off"])
+        path, params, kwargs = plex.open_calls[0]
+        self.assertEqual("/library/parts/901", path)
+        self.assertEqual({"subtitleStreamID": "1002", "allParts": "1"}, params)
+        self.assertEqual("PUT", kwargs["method"])
+
+    def test_persists_an_explicit_subtitles_off_choice(self):
+        plex = FakeSubtitleSelectionPlex()
+        handler, responses = handler_with_payload(
+            {"ratingKey": "801", "partId": "901", "streamId": "0"}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_subtitle_selection("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertTrue(responses[0][1]["off"])
+        self.assertEqual("0", plex.open_calls[0][1]["subtitleStreamID"])
+
+    def test_rejects_a_subtitle_stream_outside_the_item_part(self):
+        plex = FakeSubtitleSelectionPlex()
+        handler, responses = handler_with_payload(
+            {"ratingKey": "801", "partId": "901", "streamId": "9999"}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_subtitle_selection("POST")
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("subtitle_stream_not_found", responses[0][1]["error"])
+        self.assertEqual([], plex.open_calls)
+
+
+class DeviceDownloadsDialogTests(unittest.TestCase):
+    def test_download_manager_exposes_storage_selection_and_confirmation_controls(self):
+        html = (server.ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+        for element_id in (
+            "device-downloads",
+            "device-downloads-dialog",
+            "device-downloads-list",
+            "device-downloads-select-all",
+            "device-downloads-remove",
+            "device-downloads-confirm",
+        ):
+            self.assertIn(f'id="{element_id}"', html)
+        self.assertIn("navigator.storage?.estimate?.()", source)
+        self.assertIn("state.deviceDownloadSelection", source)
+        self.assertIn("confirmDeviceDownloadRemoval", source)
+        self.assertIn("Your Plex library, original media, and prepared server streams will not be changed.", source)
+
+    def test_offline_inventory_counts_actual_files_and_duplicate_generations(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        start = source.index("async function deviceDownloadInventory()")
+        end = source.index("async function deviceStorageEstimate()", start)
+        inventory = source[start:end]
+
+        self.assertIn("groupDeviceCacheEntries(entries)", inventory)
+        self.assertIn("listDeviceRootFiles(root)", inventory)
+        self.assertIn("deviceFileBytes(root, name)", inventory)
+        self.assertIn('name.startsWith(`${id}-`)', inventory)
+        self.assertIn("sizes.reduce((total, size) => total + size, 0)", inventory)
+
+    def test_offline_save_and_delete_refresh_the_sidebar_summary(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        save_start = source.index("async function saveDevicePlayback")
+        save_end = source.index("function revokeDeviceObjectUrls", save_start)
+        delete_start = source.index("async function deleteDevicePlayback")
+        delete_end = source.index("function setDeviceDownloadsStatus", delete_start)
+
+        self.assertIn("await refreshDeviceDownloadsSummary()", source[save_start:save_end])
+        self.assertIn("deviceDownloadInventory()", source[delete_start:delete_end])
+        self.assertIn("await refreshDeviceDownloadsSummary()", source[delete_start:delete_end])
+
+
+class SubtitleDialogTests(unittest.TestCase):
+    def test_details_dialog_lists_and_selects_existing_subtitle_tracks(self):
+        html = (server.ROOT / "static" / "index.html").read_text(encoding="utf-8")
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        render_start = source.index("function renderAvailableSubtitles(item)")
+        render_end = source.index("function applySubtitleChoiceToPlayer", render_start)
+        render_source = source[render_start:render_end]
+        select_start = source.index("async function selectAvailableSubtitle")
+        select_end = source.index("function subtitleResultMeta", select_start)
+        select_source = source[select_start:select_end]
+
+        self.assertIn('id="subtitle-saved-list"', html)
+        self.assertIn('id="subtitle-saved-status"', html)
+        self.assertIn("supportedSubtitles(item)", render_source)
+        self.assertIn('label: "Off"', render_source)
+        self.assertIn("preferredSubtitleIndex(item, subtitles)", render_source)
+        self.assertIn("[selectedChoice, offChoice", render_source)
+        self.assertIn("rememberSubtitlePreference(item, index, subtitles)", select_source)
+        self.assertIn("persistSubtitleSelection(item, index)", select_source)
+
+    def test_opening_subtitle_dialog_hydrates_tracks_without_auto_searching(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        start = source.index("async function openSubtitleDialog(item)")
+        end = source.index("async function downloadSubtitle", start)
+        dialog_source = source[start:end]
+
+        self.assertIn("renderAvailableSubtitles(item)", dialog_source)
+        self.assertIn("await hydrateItem(item)", dialog_source)
+        self.assertNotIn("searchSubtitles()", dialog_source)
+
+
+class EmbeddedSubtitleTests(unittest.TestCase):
+    def test_frontend_loads_only_the_active_track_after_resume_is_applied(self):
+        source = (server.ROOT / "static" / "app.js").read_text(encoding="utf-8")
+        configure_start = source.index("function configureSubtitles(item)")
+        configure_end = source.index("function compatibilityTranscodeRequired", configure_start)
+        configure = source[configure_start:configure_end]
+        player_start = source.index("function loadPlayerSource")
+        player_end = source.index("function stopSavePolling", player_start)
+        player_source = source[player_start:player_end]
+
+        self.assertNotIn("track.src = subtitle.subtitleUrl", configure)
+        self.assertIn('url.searchParams.set("startMs"', source)
+        self.assertIn('url.searchParams.set("windowMs"', source)
+        self.assertLess(
+            player_source.index("el.player.currentTime ="),
+            player_source.index("refreshActiveSubtitleWindow"),
+        )
+
+    def test_windowed_extract_seeks_preserves_timestamps_and_reuses_disk_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_path = root / "episode.mkv"
+            media_path.write_bytes(b"test media")
+            completed = server.subprocess.CompletedProcess(
+                args=[],
+                returncode=0,
+                stdout=b"WEBVTT\n\n00:10.000 --> 00:12.000\nHello\n",
+                stderr=b"",
+            )
+            with mock.patch.object(server.Settings, "data_dir", root / "data"), mock.patch.object(
+                server.subprocess,
+                "run",
+                return_value=completed,
+            ) as run:
+                first = server.extract_embedded_subtitle(media_path, 9, 600_000, 900_000)
+                second = server.extract_embedded_subtitle(media_path, 9, 600_000, 900_000)
+
+            self.assertEqual(first, second)
+            run.assert_called_once()
+            command = run.call_args.args[0]
+            self.assertLess(command.index("-ss"), command.index("-i"))
+            self.assertEqual("600.000", command[command.index("-ss") + 1])
+            self.assertEqual("900.000", command[command.index("-t") + 1])
+            self.assertEqual("600.000", command[command.index("-output_ts_offset") + 1])
+            self.assertEqual(1, len(list((root / "data" / "subtitle-cache").glob("*.vtt"))))
+
+    def test_subtitle_windows_are_bounded(self):
+        self.assertEqual((None, None), server.embedded_subtitle_window(1000, None))
+        self.assertEqual((0, 60_000), server.embedded_subtitle_window(-100, 10))
+        self.assertEqual(
+            (7 * 24 * 60 * 60 * 1000, 30 * 60 * 1000),
+            server.embedded_subtitle_window(99 * 24 * 60 * 60 * 1000, 9 * 60 * 60 * 1000),
+        )
+
+
+class CollectionMembershipTests(unittest.TestCase):
+    def test_lists_manual_and_read_only_smart_collections(self):
+        plex = FakeCollectionPlex(member=True)
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_collection_membership("GET", {"ratingKey": ["501"]})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual(1, responses[0][1]["memberCount"])
+        automatic, manual = responses[0][1]["collections"]
+        self.assertEqual("Automatic Picks", automatic["title"])
+        self.assertFalse(automatic["editable"])
+        self.assertEqual("Manual Picks", manual["title"])
+        self.assertTrue(manual["member"])
+        self.assertEqual([{"id": "tag-101", "tag": "Manual Picks"}], responses[0][1]["item"]["collections"])
+
+    def test_adds_movie_by_native_collection_id_and_refreshes_membership(self):
+        plex = FakeCollectionPlex()
+        handler, responses = handler_with_payload(
+            {"ratingKey": "501", "collectionRatingKey": "101", "member": True}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_collection_membership("POST", {})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual(1, responses[0][1]["memberCount"])
+        path, params, kwargs = plex.open_calls[0]
+        self.assertEqual("/library/collections/101/items", path)
+        self.assertEqual("PUT", kwargs["method"])
+        self.assertEqual(
+            "server://machine-123/com.plexapp.plugins.library/library/metadata/501",
+            params["uri"],
+        )
+
+    def test_removes_movie_by_native_collection_id(self):
+        plex = FakeCollectionPlex(member=True)
+        handler, responses = handler_with_payload(
+            {"ratingKey": "501", "collectionRatingKey": "101", "member": False}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_collection_membership("POST", {})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual(0, responses[0][1]["memberCount"])
+        self.assertEqual("/library/collections/101/items/501", plex.open_calls[0][0])
+        self.assertEqual("DELETE", plex.open_calls[0][2]["method"])
+
+    def test_rejects_smart_collection_changes(self):
+        plex = FakeCollectionPlex()
+        handler, responses = handler_with_payload(
+            {"ratingKey": "501", "collectionRatingKey": "102", "member": True}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_collection_membership("POST", {})
+
+        self.assertEqual(409, responses[0][0])
+        self.assertEqual("smart_collection_read_only", responses[0][1]["error"])
+        self.assertEqual([], plex.open_calls)
+
+    def test_rejects_non_movie_and_non_boolean_state(self):
+        plex = FakeCollectionPlex()
+        with mock.patch.object(server, "PLEX", plex):
+            handler, responses = handler_with_payload({})
+            handler.api_collection_membership("GET", {"ratingKey": ["601"]})
+            self.assertEqual("unsupported_media_type", responses[0][1]["error"])
+
+            handler, responses = handler_with_payload(
+                {"ratingKey": "501", "collectionRatingKey": "101", "member": "true"}
+            )
+            handler.api_collection_membership("POST", {})
+            self.assertEqual("invalid_member_state", responses[0][1]["error"])
+
+
+class CollectionManagementTests(unittest.TestCase):
+    def test_creates_collection_with_movie_and_refreshes_membership(self):
+        plex = FakeCollectionPlex()
+        handler, responses = handler_with_payload(
+            {"action": "create", "ratingKey": "501", "title": "New Collection"}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_collection_management("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("create", responses[0][1]["action"])
+        self.assertEqual(3, len(responses[0][1]["collections"]))
+        created = next(item for item in responses[0][1]["collections"] if item["ratingKey"] == "103")
+        self.assertTrue(created["member"])
+        path, params, kwargs = plex.open_calls[0]
+        self.assertEqual("/library/collections", path)
+        self.assertEqual("POST", kwargs["method"])
+        self.assertEqual("New Collection", params["title"])
+        self.assertEqual("7", params["sectionId"])
+        self.assertEqual(1, params["type"])
+
+    def test_renames_manual_collection_and_preserves_membership(self):
+        plex = FakeCollectionPlex(member=True)
+        handler, responses = handler_with_payload(
+            {
+                "action": "rename",
+                "ratingKey": "501",
+                "collectionRatingKey": "101",
+                "title": "Renamed Picks",
+            }
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_collection_management("POST")
+
+        self.assertEqual(200, responses[0][0])
+        renamed = next(item for item in responses[0][1]["collections"] if item["ratingKey"] == "101")
+        self.assertEqual("Renamed Picks", renamed["title"])
+        self.assertTrue(renamed["member"])
+        path, params, kwargs = plex.open_calls[0]
+        self.assertEqual("/library/sections/7/all", path)
+        self.assertEqual("PUT", kwargs["method"])
+        self.assertEqual(18, params["type"])
+
+    def test_deletes_manual_collection_without_deleting_movie(self):
+        plex = FakeCollectionPlex(member=True)
+        handler, responses = handler_with_payload(
+            {"action": "delete", "ratingKey": "501", "collectionRatingKey": "101"}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_collection_management("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertNotIn("101", [item["ratingKey"] for item in responses[0][1]["collections"]])
+        self.assertEqual("/library/collections/101", plex.open_calls[0][0])
+        self.assertEqual("DELETE", plex.open_calls[0][2]["method"])
+        self.assertEqual("501", responses[0][1]["item"]["ratingKey"])
+
+    def test_deletes_collection_directly_from_library_view(self):
+        plex = FakeCollectionPlex()
+        handler, responses = handler_with_payload(
+            {"action": "delete", "sectionKey": "7", "collectionRatingKey": "101"}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_collection_management("POST")
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("101", responses[0][1]["collectionRatingKey"])
+        self.assertEqual("/library/collections/101", plex.open_calls[0][0])
+        self.assertNotIn("101", [item["ratingKey"] for item in plex.collections])
+
+    def test_rejects_direct_delete_for_smart_collection(self):
+        plex = FakeCollectionPlex()
+        handler, responses = handler_with_payload(
+            {"action": "delete", "sectionKey": "7", "collectionRatingKey": "102"}
+        )
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_collection_management("POST")
+
+        self.assertEqual(409, responses[0][0])
+        self.assertEqual("smart_collection_read_only", responses[0][1]["error"])
+        self.assertEqual([], plex.open_calls)
+
+    def test_rejects_duplicate_and_invalid_titles(self):
+        plex = FakeCollectionPlex()
+        with mock.patch.object(server, "PLEX", plex):
+            handler, responses = handler_with_payload(
+                {"action": "create", "ratingKey": "501", "title": " manual picks "}
+            )
+            handler.api_collection_management("POST")
+            self.assertEqual(409, responses[0][0])
+            self.assertEqual("collection_title_already_exists", responses[0][1]["error"])
+
+            handler, responses = handler_with_payload(
+                {"action": "create", "ratingKey": "501", "title": "\n"}
+            )
+            handler.api_collection_management("POST")
+            self.assertEqual(400, responses[0][0])
+            self.assertEqual("invalid_collection_title", responses[0][1]["error"])
+        self.assertEqual([], plex.open_calls)
+
+    def test_rejects_smart_collection_rename_and_delete(self):
+        plex = FakeCollectionPlex()
+        with mock.patch.object(server, "PLEX", plex):
+            for action in ("rename", "delete"):
+                payload = {
+                    "action": action,
+                    "ratingKey": "501",
+                    "collectionRatingKey": "102",
+                }
+                if action == "rename":
+                    payload["title"] = "Not Allowed"
+                handler, responses = handler_with_payload(payload)
+                handler.api_collection_management("POST")
+                self.assertEqual(409, responses[0][0])
+                self.assertEqual("smart_collection_read_only", responses[0][1]["error"])
+        self.assertEqual([], plex.open_calls)
+
+
+class EpisodeNeighborTests(unittest.TestCase):
+    def test_returns_adjacent_episodes_across_season_boundaries(self):
+        plex = FakeEpisodePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_episode_neighbors({"ratingKey": ["12"]})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("11", responses[0][1]["previous"]["ratingKey"])
+        self.assertEqual("13", responses[0][1]["next"]["ratingKey"])
+        self.assertEqual(1, responses[0][1]["position"])
+        self.assertEqual(3, responses[0][1]["totalSize"])
+        self.assertEqual("/library/metadata/10/allLeaves", plex.xml_calls[1][0])
+
+    def test_last_episode_has_no_next_episode(self):
+        plex = FakeEpisodePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_episode_neighbors({"ratingKey": ["13"]})
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual("12", responses[0][1]["previous"]["ratingKey"])
+        self.assertIsNone(responses[0][1]["next"])
+
+    def test_rejects_invalid_rating_key_before_calling_plex(self):
+        plex = FakeEpisodePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_episode_neighbors({"ratingKey": ["../12"]})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_rating_key", responses[0][1]["error"])
+        self.assertEqual([], plex.xml_calls)
+
+
+class MediaDeletionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base = Path(self.temp_dir.name)
+        self.movies = self.base / "movies"
+        self.tv = self.base / "tv"
+        self.movies.mkdir()
+        self.tv.mkdir()
+        self.settings_patch = mock.patch.multiple(
+            server.Settings,
+            media_delete_enabled=True,
+            media_delete_roots=os.pathsep.join([str(self.movies), str(self.tv)]),
+            media_delete_plan_ttl=300,
+            qbittorrent_backup_dir="",
+            saved_media_dir=str(self.base / "saved"),
+        )
+        self.settings_patch.start()
+        self.audit_patch = mock.patch.object(
+            server,
+            "MEDIA_DELETE_LOG_FILE",
+            self.base / "data" / "media-delete-log.jsonl",
+        )
+        self.list_patch = mock.patch.object(
+            server,
+            "MY_LIST_FILE",
+            self.base / "data" / "my-list.json",
+        )
+        self.queue_patch = mock.patch.object(
+            server,
+            "PLAY_QUEUE_FILE",
+            self.base / "data" / "play-queue.json",
+        )
+        self.audit_patch.start()
+        self.list_patch.start()
+        self.queue_patch.start()
+
+    def tearDown(self):
+        self.queue_patch.stop()
+        self.list_patch.stop()
+        self.audit_patch.stop()
+        self.settings_patch.stop()
+        self.temp_dir.cleanup()
+
+    @staticmethod
+    def element(path, item_type="movie", rating_key="501"):
+        episode_attrs = (
+            ' grandparentTitle="Test Show" parentIndex="1" index="3"'
+            if item_type == "episode"
+            else ""
+        )
+        escaped = str(path).replace("&", "&amp;").replace('"', "&quot;")
+        return ET.fromstring(
+            f'<Video ratingKey="{rating_key}" type="{item_type}" title="Test title" '
+            f'librarySectionID="7"{episode_attrs}>'
+            f'<Media videoCodec="h264" audioCodec="aac"><Part id="1" '
+            f'key="/library/parts/1/file.mkv" file="{escaped}" /></Media></Video>'
+        )
+
+    def test_movie_deletes_its_complete_folder_and_audits_the_action(self):
+        folder = self.movies / "Test Movie (2026)"
+        folder.mkdir()
+        video = folder / "Test.Movie.2026.mkv"
+        subtitle = folder / "Test.Movie.2026.en.srt"
+        note = folder / "README.txt"
+        video.write_bytes(b"video")
+        subtitle.write_text("subtitle")
+        note.write_text("release notes")
+        plex = FakePlex()
+
+        with mock.patch.object(server, "metadata_item_element", return_value=self.element(video)), mock.patch.object(server, "PLEX", plex):
+            plan = server.build_media_delete_plan("501")
+            public = server.public_media_delete_plan(plan)
+            token = server.verify_media_delete_token(public["confirmationToken"])
+            result = server.execute_media_delete(plan)
+
+        self.assertEqual(plan["_digest"], token["digest"])
+        self.assertEqual(1, public["folderCount"])
+        self.assertEqual(3, public["fileCount"])
+        self.assertFalse(folder.exists())
+        self.assertTrue(result["ok"])
+        self.assertTrue(server.MEDIA_DELETE_LOG_FILE.is_file())
+        self.assertIn(("/library/metadata/501", {}, {"method": "DELETE"}), plex.open_calls)
+
+    def test_episode_removes_all_approved_hardlinks_but_keeps_sibling_episode(self):
+        source = self.movies / "Test.Show.S01E03.mkv"
+        source.write_bytes(b"episode")
+        source.with_suffix(".en.srt").write_text("source subtitle")
+        season = self.tv / "Test Show" / "Season 01"
+        season.mkdir(parents=True)
+        episode = season / "Test Show - S01E03.mkv"
+        os.link(source, episode)
+        episode.with_suffix(".srt").write_text("tv subtitle")
+        sibling = season / "Test Show - S01E04.mkv"
+        sibling.write_bytes(b"next")
+
+        with mock.patch.object(
+            server,
+            "metadata_item_element",
+            return_value=self.element(episode, item_type="episode"),
+        ), mock.patch.object(server, "PLEX", FakePlex()):
+            plan = server.build_media_delete_plan("501")
+            result = server.execute_media_delete(plan)
+
+        self.assertEqual(1, plan["hardLinkCopies"])
+        self.assertEqual(0, plan["folderCount"])
+        self.assertFalse(source.exists())
+        self.assertFalse(episode.exists())
+        self.assertFalse(source.with_suffix(".en.srt").exists())
+        self.assertFalse(episode.with_suffix(".srt").exists())
+        self.assertTrue(sibling.is_file())
+        self.assertTrue(season.is_dir())
+        self.assertEqual(4, result["deletedFileCount"])
+
+    def test_movie_in_shared_folder_only_deletes_matching_files(self):
+        folder = self.movies / "Shared"
+        folder.mkdir()
+        video = folder / "Wanted.mkv"
+        subtitle = folder / "Wanted.en.srt"
+        other = folder / "Keep.mkv"
+        video.write_bytes(b"wanted")
+        subtitle.write_text("subtitle")
+        other.write_bytes(b"keep")
+
+        with mock.patch.object(server, "metadata_item_element", return_value=self.element(video)), mock.patch.object(server, "PLEX", FakePlex()):
+            plan = server.build_media_delete_plan("501")
+            server.execute_media_delete(plan)
+
+        self.assertEqual(0, plan["folderCount"])
+        self.assertTrue(any("other video files" in warning for warning in plan["warnings"]))
+        self.assertFalse(video.exists())
+        self.assertFalse(subtitle.exists())
+        self.assertTrue(other.is_file())
+
+    def test_preview_blocks_a_media_folder_the_service_cannot_write(self):
+        folder = self.movies / "Read Only Movie"
+        folder.mkdir()
+        video = folder / "Read.Only.Movie.mkv"
+        video.write_bytes(b"video")
+
+        with mock.patch.object(server, "metadata_item_element", return_value=self.element(video)), mock.patch.object(server.os, "access", return_value=False):
+            plan = server.build_media_delete_plan("501")
+
+        self.assertFalse(plan["canDelete"])
+        self.assertIn("cannot write", plan["blockReason"])
+        self.assertTrue(video.is_file())
+
+    def test_refuses_media_with_an_unapproved_hardlink(self):
+        video = self.movies / "Linked.mkv"
+        video.write_bytes(b"linked")
+        outside = self.base / "outside"
+        outside.mkdir()
+        os.link(video, outside / "Linked.mkv")
+
+        with mock.patch.object(server, "metadata_item_element", return_value=self.element(video)):
+            with self.assertRaises(server.MediaDeletionError) as raised:
+                server.build_media_delete_plan("501")
+
+        self.assertEqual("hardlinks_outside_approved_roots", raised.exception.code)
+
+    def test_endpoint_requires_the_exact_confirmation_phrase(self):
+        folder = self.movies / "Confirmed Movie"
+        folder.mkdir()
+        video = folder / "Confirmed.Movie.mkv"
+        video.write_bytes(b"video")
+        elem = self.element(video)
+        with mock.patch.object(server, "metadata_item_element", return_value=elem):
+            plan = server.public_media_delete_plan(server.build_media_delete_plan("501"))
+            handler, responses = handler_with_payload(
+                {
+                    "ratingKey": "501",
+                    "confirmationToken": plan["confirmationToken"],
+                    "confirmation": "delete",
+                }
+            )
+            handler.api_media_delete("POST", {})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("confirmation_required", responses[0][1]["error"])
+        self.assertTrue(video.is_file())
+
+    def test_endpoint_rejects_a_plan_when_folder_contents_change(self):
+        folder = self.movies / "Changing Movie"
+        folder.mkdir()
+        video = folder / "Changing.Movie.mkv"
+        video.write_bytes(b"video")
+        elem = self.element(video)
+        with mock.patch.object(server, "metadata_item_element", return_value=elem):
+            plan = server.public_media_delete_plan(server.build_media_delete_plan("501"))
+            (folder / "new-file.txt").write_text("arrived after preview")
+            handler, responses = handler_with_payload(
+                {
+                    "ratingKey": "501",
+                    "confirmationToken": plan["confirmationToken"],
+                    "confirmation": "DELETE",
+                }
+            )
+            handler.api_media_delete("POST", {})
+
+        self.assertEqual(409, responses[0][0])
+        self.assertEqual("deletion_plan_changed", responses[0][1]["error"])
+        self.assertTrue(video.is_file())
+
+
+class MyListTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.path_patch = mock.patch.object(server, "MY_LIST_FILE", Path(self.temp_dir.name) / "my-list.json")
+        self.path_patch.start()
+
+    def tearDown(self):
+        self.path_patch.stop()
+        self.temp_dir.cleanup()
+
+    def test_add_list_and_remove_are_persisted_in_newest_first_order(self):
+        plex = FakePlex()
+        with mock.patch.object(server, "PLEX", plex):
+            for rating_key in ("101", "102"):
+                handler, responses = handler_with_payload({"ratingKey": rating_key, "saved": True})
+                handler.api_my_list("POST", {})
+                self.assertEqual(200, responses[0][0])
+
+            handler, responses = handler_with_payload({})
+            handler.api_my_list("GET", {"keysOnly": ["1"]})
+            self.assertEqual(["102", "101"], responses[0][1]["ratingKeys"])
+
+            handler, responses = handler_with_payload({"ratingKey": "102", "saved": False})
+            handler.api_my_list("POST", {})
+            self.assertEqual(["101"], responses[0][1]["ratingKeys"])
+
+        self.assertTrue(server.MY_LIST_FILE.exists())
+        self.assertEqual(["101"], server.my_list_keys())
+
+    def test_my_list_library_view_filters_items_by_section(self):
+        server.update_my_list("101", True)
+        server.update_my_list("202", True)
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_library(
+                "/api/library/7",
+                {"view": ["mylist"], "start": ["0"], "limit": ["10"]},
+            )
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual(1, responses[0][1]["totalSize"])
+        self.assertEqual(["101"], [item["ratingKey"] for item in responses[0][1]["items"]])
+        self.assertTrue(responses[0][1]["items"][0]["inMyList"])
+
+    def test_my_list_rejects_non_boolean_saved_state(self):
+        handler, responses = handler_with_payload({"ratingKey": "101", "saved": "true"})
+        handler.api_my_list("POST", {})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_saved_state", responses[0][1]["error"])
+
+
+class PlayQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        root = Path(self.temp_dir.name)
+        self.queue_patch = mock.patch.object(server, "PLAY_QUEUE_FILE", root / "play-queue.json")
+        self.list_patch = mock.patch.object(server, "MY_LIST_FILE", root / "my-list.json")
+        self.queue_patch.start()
+        self.list_patch.start()
+
+    def tearDown(self):
+        self.list_patch.stop()
+        self.queue_patch.stop()
+        self.temp_dir.cleanup()
+
+    def test_add_duplicate_and_remove_preserve_queue_order(self):
+        plex = FakePlex()
+        with mock.patch.object(server, "PLEX", plex):
+            for rating_key in ("101", "102", "101"):
+                handler, responses = handler_with_payload({"ratingKey": rating_key, "queued": True})
+                handler.api_play_queue("POST", {})
+                self.assertEqual(200, responses[0][0])
+
+            handler, responses = handler_with_payload({})
+            handler.api_play_queue("GET", {"keysOnly": ["1"]})
+            self.assertEqual(["101", "102"], responses[0][1]["queueRatingKeys"])
+
+            handler, responses = handler_with_payload({"ratingKey": "101", "queued": False})
+            handler.api_play_queue("POST", {})
+            self.assertEqual(["102"], responses[0][1]["queueRatingKeys"])
+
+        metadata_calls = [call for call in plex.xml_calls if call[0].startswith("/library/metadata/")]
+        self.assertEqual(2, len(metadata_calls))
+
+        self.assertEqual(["102"], server.play_queue_keys())
+
+    def test_queue_library_view_filters_items_without_changing_global_order(self):
+        server.update_play_queue("101", True)
+        server.update_play_queue("202", True)
+        plex = FakePlex()
+        handler, responses = handler_with_payload({})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_library(
+                "/api/library/7",
+                {"view": ["queue"], "start": ["0"], "limit": ["10"]},
+            )
+
+        self.assertEqual(200, responses[0][0])
+        self.assertEqual(["101", "202"], responses[0][1]["queueRatingKeys"])
+        self.assertEqual(["101"], [item["ratingKey"] for item in responses[0][1]["items"]])
+        self.assertTrue(responses[0][1]["items"][0]["inPlayQueue"])
+
+    def test_queue_rejects_non_boolean_state(self):
+        handler, responses = handler_with_payload({"ratingKey": "101", "queued": "true"})
+        handler.api_play_queue("POST", {})
+
+        self.assertEqual(400, responses[0][0])
+        self.assertEqual("invalid_queued_state", responses[0][1]["error"])
+
+    def test_queue_rejects_new_items_when_full_without_calling_plex(self):
+        server.PLAY_QUEUE_FILE.write_text(json.dumps({"ratingKeys": [str(value) for value in range(100)]}))
+        plex = FakePlex()
+        handler, responses = handler_with_payload({"ratingKey": "999", "queued": True})
+        with mock.patch.object(server, "PLEX", plex):
+            handler.api_play_queue("POST", {})
+
+        self.assertEqual(409, responses[0][0])
+        self.assertEqual("play_queue_full", responses[0][1]["error"])
+        self.assertEqual([], plex.xml_calls)
+
+
+if __name__ == "__main__":
+    unittest.main()
